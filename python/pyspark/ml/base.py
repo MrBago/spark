@@ -47,6 +47,20 @@ class Estimator(Params):
         """
         raise NotImplementedError()
 
+    def fitTasks(self, dataset, paramMaps):
+        """
+        Create fitFunctions, one per paramMap in paramMaps. Each fit function should return a model.
+
+        :param dataset: input dataset, which is an instance of :py:class:`pyspark.sql.DataFrame`
+        :param params: The list of paramMaps to be trained over. 
+        :returns: List of functions which each return a model.
+        """
+        def trainWithParams(params):
+            def singleTrain():
+                return self.fit(dataset, params)
+            return singleTrain
+        return [trainWithParams(p) for p in paramMaps]
+
     @since("1.3.0")
     def fit(self, dataset, params=None):
         """
@@ -61,7 +75,8 @@ class Estimator(Params):
         if params is None:
             params = dict()
         if isinstance(params, (list, tuple)):
-            return [self.fit(dataset, paramMap) for paramMap in params]
+            fitFunctions = self.fitTasks(dataset, params)
+            return [f() for f in fitFunctions]
         elif isinstance(params, dict):
             if params:
                 return self.copy(params)._fit(dataset)

@@ -266,13 +266,13 @@ class CrossValidator(Estimator, ValidatorParams, HasParallelism, MLReadable, MLW
             validation = df.filter(condition).cache()
             train = df.filter(~condition).cache()
 
-            def singleTrain(paramMap):
-                model = est.fit(train, paramMap)
+            def singleTask(fitModelTask, paramMap):
                 # TODO: duplicate evaluator to take extra params from input
-                metric = eva.evaluate(model.transform(validation, paramMap))
+                metric = eva.evaluate(fitModelTask().transform(validation, paramMap))
                 return metric
 
-            currentFoldMetrics = pool.map(singleTrain, epm)
+            taskArgs = zip(est.fitTasks(train, epm), epm)
+            currentFoldMetrics = pool.map(lambda args: singleTask(*args), taskArgs)
             for j in range(numModels):
                 metrics[j] += (currentFoldMetrics[j] / nFolds)
             validation.unpersist()
