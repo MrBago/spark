@@ -172,6 +172,11 @@ class LogisticRegressionSuite
     assert(copiedModel.hasSummary)
     model.setSummary(None)
     assert(!model.hasSummary)
+
+    val path = "/tmp/logReg/"
+    model.write.save(path)
+    val model2 = LogisticRegressionModel.load(path)
+    model2.transform(smallBinaryDataset).collect()
   }
 
   test("logistic regression: illegal params") {
