@@ -17,10 +17,12 @@
 
 package org.apache.spark
 
-import java.util.{Properties, Timer, TimerTask}
+import java.util.Properties
+import java.util.concurrent.TimeoutException
 
 import scala.concurrent.duration._
 import scala.language.postfixOps
+import scala.util.{Failure, Success => TrySuccess, Try}
 
 import org.apache.spark.annotation.{Experimental, Since}
 import org.apache.spark.executor.TaskMetrics
@@ -46,8 +48,6 @@ class BarrierTaskContext private[spark] (
     val env = SparkEnv.get
     RpcUtils.makeDriverRef("barrierSync", env.conf, env.rpcEnv)
   }
-
-  private val timer = new Timer("Barrier task timer for barrier() calls.")
 
   // Local barrierEpoch that identify a barrier() call from current task, it shall be identical
   // with the driver side epoch.
@@ -105,39 +105,41 @@ class BarrierTaskContext private[spark] (
     logTrace("Current callSite: " + Utils.getCallSite())
 
     val startTime = System.currentTimeMillis()
-    val timerTask = new TimerTask {
-      override def run(): Unit = {
-        logInfo(s"Task $taskAttemptId from Stage $stageId(Attempt $stageAttemptNumber) waiting " +
-          s"under the global sync since $startTime, has been waiting for " +
-          s"${(System.currentTimeMillis() - startTime) / 1000} seconds, current barrier epoch " +
-          s"is $barrierEpoch.")
-      }
-    }
-    // Log the update of global sync every 60 seconds.
-    timer.schedule(timerTask, 60000, 60000)
 
-    try {
-      barrierCoordinator.askSync[Unit](
-        message = RequestToSync(numTasks, stageId, stageAttemptNumber, taskAttemptId,
-          barrierEpoch),
-        // Set a fixed timeout for RPC here, so users shall get a SparkException thrown by
-        // BarrierCoordinator on timeout, instead of RPCTimeoutException from the RPC framework.
-        timeout = new RpcTimeout(31536000 /* = 3600 * 24 * 365 */ seconds, "barrierTimeout"))
-      barrierEpoch += 1
-      logInfo(s"Task $taskAttemptId from Stage $stageId(Attempt $stageAttemptNumber) finished " +
-        "global sync successfully, waited for " +
-        s"${(System.currentTimeMillis() - startTime) / 1000} seconds, current barrier epoch is " +
-        s"$barrierEpoch.")
-    } catch {
-      case e: SparkException =>
-        logInfo(s"Task $taskAttemptId from Stage $stageId(Attempt $stageAttemptNumber) failed " +
-          "to perform global sync, waited for " +
-          s"${(System.currentTimeMillis() - startTime) / 1000} seconds, current barrier epoch " +
-          s"is $barrierEpoch.")
-        throw e
-    } finally {
-      timerTask.cancel()
-      timer.purge()
+    val syncMessage = barrierCoordinator.ask[Unit](
+      message = RequestToSync(numTasks, stageId, stageAttemptNumber, taskAttemptId, barrierEpoch),
+      // Set a fixed timeout for RPC here, so users shall get a SparkException thrown by
+      // BarrierCoordinator on timeout, instead of RPCTimeoutException from the RPC framework.
+      timeout = new RpcTimeout(31536000 /* = 3600 * 24 * 365 */ seconds, "barrierTimeout"))
+
+    val loggingInterval = 60.seconds
+    while (true) {
+      Try(ThreadUtils.awaitResult(syncMessage, loggingInterval)) match {
+        case Failure(_: TimeoutException) =>
+          // Logging interval reached, log and keep waiting
+          logInfo(s"Task $taskAttemptId from Stage $stageId(Attempt $stageAttemptNumber) waiting " +
+            s"under the global sync since $startTime, has been waiting for " +
+            s"${(System.currentTimeMillis() - startTime) / 1000} seconds, current barrier epoch " +
+            s"is $barrierEpoch.")
+        case Failure(e: SparkException) =>
+          // Failed stage, log failure and throw SparkException
+          logInfo(s"Task $taskAttemptId from Stage $stageId(Attempt $stageAttemptNumber) failed " +
+            "to perform global sync, waited for " +
+            s"${(System.currentTimeMillis() - startTime) / 1000} seconds, current barrier epoch " +
+            s"is $barrierEpoch.")
+          throw e
+        case Failure(e) =>
+          // Unexpected failure, throw error
+          throw e
+        case TrySuccess(_) =>
+          // Sync successful, increment epoch, log success and exit
+          barrierEpoch += 1
+          logInfo(s"Task $taskAttemptId from Stage $stageId(Attempt $stageAttemptNumber) " +
+            "finished global sync successfully, waited for " +
+            s"${(System.currentTimeMillis() - startTime) / 1000} seconds, current barrier epoch " +
+            s"is $barrierEpoch.")
+          return
+      }
     }
   }
 
